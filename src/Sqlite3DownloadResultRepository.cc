@@ -81,6 +81,22 @@ int64_t currentUnixMs()
 const char* const kDeleteByGidSql =
     "DELETE FROM download_history WHERE gid = ?";
 
+std::string excludedGidCondition(const std::vector<a2_gid_t>& excluded)
+{
+  if (excluded.empty()) {
+    return {};
+  }
+  std::ostringstream condition;
+  condition << " AND h.gid NOT IN (";
+  const char* separator = "";
+  for (auto gid : excluded) {
+    condition << separator << "'" << GroupId::toHex(gid) << "'";
+    separator = ",";
+  }
+  condition << ")";
+  return condition.str();
+}
+
 const char* const kInsertHistorySql =
     "INSERT INTO download_history"
     " (gid, status, result_code, result_message, total_length, completed_length,"
@@ -139,7 +155,8 @@ const char* const kFetchByGidSql =
     "       in_memory, serialized, metadata_uri,"
     "       bt_name, bt_announce_list, bt_comment, bt_creation_date, bt_mode,"
     "       bt_is_private, bt_local_path, finished_at"
-    " FROM download_history WHERE gid = ? LIMIT 1";
+    " FROM download_history WHERE gid = ?"
+    " ORDER BY id DESC LIMIT 1";
 
 const char* const kSelectFilesSql =
     "SELECT file_index, path, length, selected"
@@ -730,6 +747,46 @@ void Sqlite3DownloadResultRepository::doInsert(
       }
     }
   });
+}
+
+int64_t Sqlite3DownloadResultRepository::countUnique(
+    const std::vector<a2_gid_t>& excluded) const
+{
+  auto sql = std::string("SELECT COUNT(DISTINCT h.gid) FROM download_history h"
+                         " WHERE 1 = 1") + excludedGidCondition(excluded);
+  StmtGuard statement;
+  if (sqlite3_prepare_v2(store_->raw(), sql.c_str(), -1, &statement.stmt,
+                        nullptr) != SQLITE_OK ||
+      sqlite3_step(statement) != SQLITE_ROW) {
+    throw DL_ABORT_EX(fmt("sqlite3-persistence: countUnique failed: %s",
+                          sqlite3_errmsg(store_->raw())));
+  }
+  return sqlite3_column_int64(statement, 0);
+}
+
+std::vector<std::shared_ptr<DownloadResult>>
+Sqlite3DownloadResultRepository::rangeUnique(
+    int offset, int num, bool desc,
+    const std::vector<a2_gid_t>& excluded) const
+{
+  if (offset < 0 || num <= 0) {
+    return {};
+  }
+  auto sql = std::string(kSelectCols) +
+      " WHERE h.id IN (SELECT MAX(id) FROM download_history GROUP BY gid)" +
+      excludedGidCondition(excluded) +
+      (desc ? " ORDER BY h.finished_at DESC, h.id DESC"
+            : " ORDER BY h.finished_at ASC, h.id ASC") +
+      " LIMIT ? OFFSET ?";
+  StmtGuard statement;
+  if (sqlite3_prepare_v2(store_->raw(), sql.c_str(), -1, &statement.stmt,
+                        nullptr) != SQLITE_OK) {
+    throw DL_ABORT_EX(fmt("sqlite3-persistence: rangeUnique failed: %s",
+                          sqlite3_errmsg(store_->raw())));
+  }
+  sqlite3_bind_int(statement, 1, num);
+  sqlite3_bind_int(statement, 2, offset);
+  return collectResults(statement, store_->raw());
 }
 
 int64_t Sqlite3DownloadResultRepository::countAll() const

@@ -1,0 +1,118 @@
+name: History compatibility
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: history-compatibility-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y autoconf automake autopoint libtool pkg-config g++ make \
+            libssl-dev libc-ares-dev zlib1g-dev libsqlite3-dev libssh2-1-dev libcppunit-dev
+      - name: Build and run CppUnit
+        run: |
+          autoreconf -fi
+          ./configure --with-openssl --without-gnutls --with-sqlite3 --disable-nls
+          make -j2 check
+      - name: Verify history and restart behavior
+        run: python3 test/e2e/history-persistence.e2e.py src/aria2c test-results/history-linux
+      - name: Upload test diagnostics
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: history-linux-diagnostics
+          path: |
+            test/test-suite.log
+            test-results/history-linux/**/verification.json
+            test-results/history-linux/**/candidate-output.log
+          if-no-files-found: ignore
+
+  windows-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Build static Windows x64 binary
+        run: |
+          docker build -f Dockerfile.mingw --build-arg HOST=x86_64-w64-mingw32 -t aria2-history .
+          container=$(docker create aria2-history)
+          trap 'docker rm "$container"' EXIT
+          mkdir -p dist
+          docker cp "$container:/aria2/src/aria2c.exe" dist/aria2c.exe
+          docker cp "$container:/aria2/windows-pe.txt" dist/windows-pe.txt
+          cp COPYING AUTHORS dist/
+          printf '%s\n' "$GITHUB_SHA" > dist/source-revision.txt
+          (cd dist && sha256sum aria2c.exe > SHA256SUMS)
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: windows-x64-candidate
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  windows-verification:
+    needs: [unit-tests, windows-build]
+    runs-on: windows-2025
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: windows-x64-candidate
+          path: dist
+      - name: Verify artifact identity
+        shell: pwsh
+        run: |
+          $expected = ((Get-Content dist/SHA256SUMS).Trim() -split '\s+')[0]
+          $actual = (Get-FileHash dist/aria2c.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($expected -ne $actual) { throw 'Binary checksum mismatch' }
+          if ((Get-Content dist/source-revision.txt).Trim() -ne $env:GITHUB_SHA) { throw 'Source revision mismatch' }
+          & ./dist/aria2c.exe --version
+          if ($LASTEXITCODE -ne 0) { throw 'Binary startup failed' }
+      - name: Verify pagination, details, authentication and restarts
+        run: python test/e2e/history-persistence.e2e.py dist/aria2c.exe test-results/history-windows
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: 24
+      - name: Verify upstream security and WebSocket regressions
+        env:
+          ARIA2_E2E_BIN: ${{ github.workspace }}\dist\aria2c.exe
+        run: node --test --test-timeout=60000 test/e2e/security-regressions.e2e.test.mjs test/e2e/websocket-rpc-contract.e2e.test.mjs
+      - name: Collect verification evidence
+        shell: pwsh
+        run: Copy-Item test-results/history-windows/verification.json dist/history-verification.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: aria2-history-fix-windows-x64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Upload Windows test diagnostics
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: history-windows-diagnostics
+          path: |
+            test-results/history-windows/**/verification.json
+            test-results/history-windows/**/candidate-output.log
+          if-no-files-found: ignore

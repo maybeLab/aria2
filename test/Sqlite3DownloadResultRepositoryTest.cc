@@ -57,6 +57,7 @@ class Sqlite3DownloadResultRepositoryTest : public CppUnit::TestFixture {
   CPPUNIT_TEST_SUITE(Sqlite3DownloadResultRepositoryTest);
   CPPUNIT_TEST(testInsertWritesAllThreeTables);
   CPPUNIT_TEST(testRangeAscDesc);
+  CPPUNIT_TEST(testUniqueHistoryRange);
   CPPUNIT_TEST(testTrimToCapFifo);
   CPPUNIT_TEST(testTrimRespectsKeepUnfinished);
   CPPUNIT_TEST(testSearchByStatus);
@@ -130,6 +131,7 @@ public:
   void tearDown() CXX11_OVERRIDE;
   void testInsertWritesAllThreeTables();
   void testRangeAscDesc();
+  void testUniqueHistoryRange();
   void testTrimToCapFifo();
   void testTrimRespectsKeepUnfinished();
   void testSearchByStatus();
@@ -240,6 +242,45 @@ void Sqlite3DownloadResultRepositoryTest::testRangeAscDesc()
   // Empty range (offset beyond total)
   auto empty = repo.range(10, 2, false);
   CPPUNIT_ASSERT_EQUAL(static_cast<size_t>(0), empty.size());
+}
+
+void Sqlite3DownloadResultRepositoryTest::testUniqueHistoryRange()
+{
+  Sqlite3DownloadResultRepository repository(store_.get());
+  auto first = makeDr(error_code::FINISHED, "/tmp/first.bin");
+  auto second = makeDr(error_code::FINISHED, "/tmp/second.bin");
+  repository.insert(first);
+  setLastFinishedAt(1000);
+  repository.insert(second);
+  setLastFinishedAt(2000);
+  first->result = error_code::REMOVED;
+  repository.insert(first);
+  setLastFinishedAt(3000);
+  CPPUNIT_ASSERT_EQUAL(int64_t(3), repository.countAll());
+  CPPUNIT_ASSERT_EQUAL(int64_t(2), repository.countUnique({}));
+  auto ascending = repository.rangeUnique(0, 10, false, {});
+  CPPUNIT_ASSERT_EQUAL(size_t(2), ascending.size());
+  CPPUNIT_ASSERT_EQUAL(second->gid->getNumericId(),
+                        ascending[0]->gid->getNumericId());
+  CPPUNIT_ASSERT_EQUAL(first->gid->getNumericId(),
+                        ascending[1]->gid->getNumericId());
+  CPPUNIT_ASSERT_EQUAL(error_code::REMOVED, ascending[1]->result);
+  auto descending = repository.rangeUnique(0, 10, true, {});
+  CPPUNIT_ASSERT_EQUAL(first->gid->getNumericId(),
+                        descending[0]->gid->getNumericId());
+  auto page = repository.rangeUnique(1, 1, true, {});
+  CPPUNIT_ASSERT_EQUAL(size_t(1), page.size());
+  CPPUNIT_ASSERT_EQUAL(second->gid->getNumericId(), page[0]->gid->getNumericId());
+  std::vector<a2_gid_t> excluded{first->gid->getNumericId()};
+  CPPUNIT_ASSERT_EQUAL(int64_t(1), repository.countUnique(excluded));
+  auto filtered = repository.rangeUnique(0, 10, false, excluded);
+  CPPUNIT_ASSERT_EQUAL(size_t(1), filtered.size());
+  CPPUNIT_ASSERT_EQUAL(second->gid->getNumericId(),
+                        filtered[0]->gid->getNumericId());
+  CPPUNIT_ASSERT(repository.rangeUnique(2, 2, false, {}).empty());
+  CPPUNIT_ASSERT(repository.rangeUnique(0, 0, false, {}).empty());
+  CPPUNIT_ASSERT_EQUAL(error_code::REMOVED,
+                        repository.fetchByGid(first->gid->getNumericId())->result);
 }
 
 void Sqlite3DownloadResultRepositoryTest::testTrimToCapFifo()

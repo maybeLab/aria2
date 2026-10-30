@@ -239,6 +239,32 @@ a2_gid_t str2Gid(const String* str)
 } // namespace
 
 namespace {
+a2_gid_t str2ResultGid(const String* value, DownloadEngine* engine)
+{
+  (void)engine;
+#ifdef HAVE_SQLITE3
+  a2_gid_t gid = 0;
+  if (engine->getRequestGroupMan()->getRepository() &&
+      value->s().size() == sizeof(a2_gid_t) * 2 &&
+      GroupId::toNumericId(gid, value->s().c_str()) == 0) {
+    return gid;
+  }
+#endif
+  return str2Gid(value);
+}
+
+std::shared_ptr<DownloadResult> findStoppedResult(DownloadEngine* engine,
+                                                a2_gid_t gid)
+{
+  auto result = engine->getRequestGroupMan()->findDownloadResult(gid);
+#ifdef HAVE_SQLITE3
+  if (!result && engine->getRequestGroupMan()->getRepository()) {
+    result = engine->getRequestGroupMan()->getRepository()->fetchByGid(gid);
+  }
+#endif
+  return result;
+}
+
 template <typename OutputIterator>
 void extractUris(OutputIterator out, const List* src)
 {
@@ -1093,11 +1119,11 @@ std::unique_ptr<ValueBase> GetFilesRpcMethod::process(const RpcRequest& req,
 {
   const String* gidParam = checkRequiredParam<String>(req, 0);
 
-  a2_gid_t gid = str2Gid(gidParam);
+  a2_gid_t gid = str2ResultGid(gidParam, e);
   auto files = List::g();
   auto group = e->getRequestGroupMan()->findGroup(gid);
   if (!group) {
-    auto dr = e->getRequestGroupMan()->findDownloadResult(gid);
+    auto dr = findStoppedResult(e, gid);
     if (!dr) {
       throw DL_ABORT_EX(fmt("No file data is available for GID#%s",
                             GroupId::toHex(gid).c_str()));
@@ -1167,14 +1193,14 @@ std::unique_ptr<ValueBase> TellStatusRpcMethod::process(const RpcRequest& req,
   const String* gidParam = checkRequiredParam<String>(req, 0);
   const List* keysParam = checkParam<List>(req, 1);
 
-  a2_gid_t gid = str2Gid(gidParam);
+  a2_gid_t gid = str2ResultGid(gidParam, e);
   std::vector<std::string> keys;
   toStringList(std::back_inserter(keys), keysParam);
 
   auto group = e->getRequestGroupMan()->findGroup(gid);
   auto entryDict = Dict::g();
   if (!group) {
-    auto ds = e->getRequestGroupMan()->findDownloadResult(gid);
+    auto ds = findStoppedResult(e, gid);
     if (!ds) {
       throw DL_ABORT_EX(
           fmt("No such download for GID#%s", GroupId::toHex(gid).c_str()));
@@ -1425,16 +1451,21 @@ std::unique_ptr<ValueBase> GetOptionRpcMethod::process(const RpcRequest& req,
 {
   const String* gidParam = checkRequiredParam<String>(req, 0);
 
-  a2_gid_t gid = str2Gid(gidParam);
+  a2_gid_t gid = str2ResultGid(gidParam, e);
   auto group = e->getRequestGroupMan()->findGroup(gid);
   auto result = Dict::g();
   if (!group) {
-    auto dr = e->getRequestGroupMan()->findDownloadResult(gid);
+    auto dr = findStoppedResult(e, gid);
     if (!dr) {
       throw DL_ABORT_EX(
           fmt("Cannot get option for GID#%s", GroupId::toHex(gid).c_str()));
     }
-    pushRequestOption(result.get(), dr->option, getOptionParser());
+    if (dr->option) {
+      pushRequestOption(result.get(), dr->option, getOptionParser());
+    }
+    else {
+      result->put(PREF_DIR->k, dr->dir);
+    }
   }
   else {
     pushRequestOption(result.get(), group->getOption(), getOptionParser());
@@ -1636,8 +1667,11 @@ GetGlobalStatRpcMethod::process(const RpcRequest& req, DownloadEngine* e)
   res->put(KEY_DOWNLOAD_SPEED, util::itos(ts.downloadSpeed));
   res->put(KEY_UPLOAD_SPEED, util::itos(ts.uploadSpeed));
   res->put(KEY_NUM_WAITING, util::uitos(rgman->getReservedGroups().size()));
-  res->put(KEY_NUM_STOPPED, util::uitos(rgman->getDownloadResults().size()));
-  res->put(KEY_NUM_STOPPED_TOTAL, util::uitos(rgman->getNumStoppedTotal()));
+  auto stoppedCount = rgman->getDownloadResultsCount();
+  res->put(KEY_NUM_STOPPED, util::itos(stoppedCount));
+  res->put(KEY_NUM_STOPPED_TOTAL,
+           util::itos(std::max(stoppedCount,
+                               static_cast<int64_t>(rgman->getNumStoppedTotal()))));
   res->put(KEY_NUM_ACTIVE, util::uitos(rgman->getRequestGroups().size()));
   return std::move(res);
 }

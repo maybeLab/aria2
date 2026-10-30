@@ -102,6 +102,12 @@ public:
   // Returns total count of rows in download_history.
   int64_t countAll() const;
 
+  int64_t countUnique(const std::vector<a2_gid_t>& excluded) const;
+
+  std::vector<std::shared_ptr<DownloadResult>>
+  rangeUnique(int offset, int num, bool desc,
+              const std::vector<a2_gid_t>& excluded) const;
+
   // Returns count of rows matching the given filter.
   int64_t countWithFilter(const SearchFilter& f) const;
 

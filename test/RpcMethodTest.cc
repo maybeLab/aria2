@@ -118,6 +118,7 @@ class RpcMethodTest : public CppUnit::TestFixture {
   CPPUNIT_TEST(testAddUriPersistsTaskRow);
   CPPUNIT_TEST(testTellStoppedReadsBeyondMemoryCache);
   CPPUNIT_TEST(testTellStoppedAfterCascadedAddDownloadResult);
+  CPPUNIT_TEST(testUniqueHistoryPaginationAndReads);
   CPPUNIT_TEST(testGetDownloadResultCount);
   CPPUNIT_TEST(testSearchByPathLikeAndStatus);
   CPPUNIT_TEST(testExportSessionWritesSerializerOutput);
@@ -214,6 +215,7 @@ public:
   void testAddUriPersistsTaskRow();
   void testTellStoppedReadsBeyondMemoryCache();
   void testTellStoppedAfterCascadedAddDownloadResult();
+  void testUniqueHistoryPaginationAndReads();
   void testGetDownloadResultCount();
   void testSearchByPathLikeAndStatus();
   void testExportSessionWritesSerializerOutput();
@@ -2066,9 +2068,9 @@ void RpcMethodTest::testTellStoppedAfterCascadedAddDownloadResult()
 
   const List* list = downcast<List>(res.param.get());
   CPPUNIT_ASSERT(list != nullptr);
-  // At least one entry expected (the cascaded DR). Both mem and DB-
-  // reconstructed (transient gid) paths must serialize without crashing.
-  CPPUNIT_ASSERT(list->size() >= 1);
+  CPPUNIT_ASSERT_EQUAL(size_t(1), list->size());
+  CPPUNIT_ASSERT_EQUAL(int64_t(1),
+                        e_->getRequestGroupMan()->getDownloadResultsCount());
 
   // Verify the entry has a non-null gid that matches the historical hex
   // when stringified.
@@ -2094,6 +2096,71 @@ void RpcMethodTest::testTellStoppedAfterCascadedAddDownloadResult()
 #endif // HAVE_SQLITE3
 
 #ifdef HAVE_SQLITE3
+void RpcMethodTest::testUniqueHistoryPaginationAndReads()
+{
+  std::string databasePath =
+      std::string(A2_TEST_OUT_DIR) + "/unique_history.db";
+  std::remove(databasePath.c_str());
+  std::remove((databasePath + "-wal").c_str());
+  std::remove((databasePath + "-shm").c_str());
+  auto store = make_unique<Sqlite3PersistenceStore>(databasePath);
+  store->open();
+  e_->setSqlite3Store(std::move(store));
+  auto repository = make_unique<Sqlite3DownloadResultRepository>(e_->getSqlite3Store());
+  auto& manager = e_->getRequestGroupMan();
+  manager->setRepository(repository.get());
+  manager->setMaxDownloadResult(2);
+  std::vector<a2_gid_t> expected;
+  for (int position = 0; position < 6; ++position) {
+    auto result = std::make_shared<DownloadResult>();
+    result->gid = GroupId::create();
+    result->result = error_code::FINISHED;
+    result->option = option_;
+    result->dir = A2_TEST_OUT_DIR;
+    result->fileEntries.push_back(std::make_shared<FileEntry>(
+        "/tmp/unique-" + util::itos(position), 1024, 0));
+    result->totalLength = 1024;
+    result->completedLength = 1024;
+    result->numPieces = 1;
+    result->pieceLength = 1024;
+    expected.push_back(result->gid->getNumericId());
+    manager->addDownloadResult(result);
+  }
+  CPPUNIT_ASSERT_EQUAL(int64_t(6), manager->getDownloadResultsCount());
+  CPPUNIT_ASSERT(manager->getDownloadResultsRange(-1, 1, true).front() ==
+                  manager->getDownloadResults().get(expected.back()));
+  for (bool descending : {false, true}) {
+    for (int start = 0; start <= 6; ++start) {
+      auto results = manager->getDownloadResultsRange(
+          descending ? -start - 1 : start, 2, descending);
+      auto expectedSize = static_cast<size_t>(std::min(2, 6 - start));
+      CPPUNIT_ASSERT_EQUAL(expectedSize, results.size());
+      for (size_t index = 0; index < results.size(); ++index) {
+        auto expectedIndex = descending ? 5 - start - index : start + index;
+        CPPUNIT_ASSERT_EQUAL(expected[expectedIndex],
+                              results[index]->gid->getNumericId());
+      }
+    }
+  }
+  GetGlobalStatRpcMethod statistics;
+  auto stats = statistics.execute(createReq(GetGlobalStatRpcMethod::getMethodName()), e_.get());
+  CPPUNIT_ASSERT_EQUAL(std::string("6"),
+                        getString(downcast<Dict>(stats.param), "numStopped"));
+  TellStatusRpcMethod status;
+  GetFilesRpcMethod files;
+  GetOptionRpcMethod options;
+  auto verifyRead = [&](RpcMethod& method, const std::string& name) {
+    auto request = createReq(name);
+    request.params->append(GroupId::toHex(expected.front()));
+    auto response = method.execute(std::move(request), e_.get());
+    CPPUNIT_ASSERT_EQUAL(0, response.code);
+  };
+  verifyRead(status, TellStatusRpcMethod::getMethodName());
+  verifyRead(files, GetFilesRpcMethod::getMethodName());
+  verifyRead(options, GetOptionRpcMethod::getMethodName());
+  manager->setRepository(nullptr);
+}
+
 void RpcMethodTest::testGetDownloadResultCount()
 {
   std::string dbPath = std::string(A2_TEST_OUT_DIR) + "/get_drc.db";

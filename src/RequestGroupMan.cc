@@ -35,6 +35,7 @@
 #include "RequestGroupMan.h"
 
 #include <iterator>
+#include <set>
 #include <unistd.h>
 #include <cstring>
 #include <iomanip>
@@ -1189,128 +1190,86 @@ RequestGroupMan::getDownloadResultsRange(int offset, int num, bool desc) const
   if (num <= 0) {
     return result;
   }
-
-  // Snapshot memory list (oldest-first, as stored).
-  std::vector<std::shared_ptr<DownloadResult>> mem;
-  mem.reserve(downloadResults_.size());
-  for (auto& dr : downloadResults_) {
-    mem.push_back(dr);
+  std::set<a2_gid_t> seen;
+  std::vector<std::shared_ptr<DownloadResult>> memory;
+  for (const auto& group : requestGroups_) {
+    seen.insert(group->getGID());
   }
-  const int M = static_cast<int>(mem.size());
-
+  for (const auto& group : reservedGroups_) {
+    seen.insert(group->getGID());
+  }
+  for (const auto& entry : downloadResults_) {
+    if (seen.insert(entry->gid->getNumericId()).second) {
+      memory.push_back(entry);
+    }
+  }
+  const int64_t memoryCount = memory.size();
+  const int64_t start = desc ? -static_cast<int64_t>(offset) - 1
+                             : std::max<int64_t>(offset, 0);
+  auto appendMemory = [&](int64_t first, int limit) {
+    for (int64_t position = first;
+         position < memoryCount && static_cast<int>(result.size()) < limit;
+         ++position) {
+      result.push_back(memory[desc ? memoryCount - 1 - position : position]);
+    }
+  };
 #ifdef HAVE_SQLITE3
-  int D = 0;
   if (repo_) {
     try {
-      D = static_cast<int>(repo_->countAll());
-    }
-    catch (Exception& ex) {
-      A2_LOG_ERROR_EX("sqlite3-persistence: countAll failed in tellStopped; "
-                      "degrading to memory-only",
-                      ex);
-    }
-  }
-#else
-  const int D = 0;
-#endif
-
-  if (!desc) {
-    // ASC slice (offset >= 0 by contract)
-    int off = (offset < 0) ? 0 : offset;
-    if (off >= D + M) {
+      std::vector<a2_gid_t> excluded(seen.begin(), seen.end());
+      if (desc) {
+        appendMemory(start, num);
+        if (static_cast<int>(result.size()) < num) {
+          auto more = repo_->rangeUnique(
+              static_cast<int>(std::max<int64_t>(start - memoryCount, 0)),
+              num - static_cast<int>(result.size()), true, excluded);
+          result.insert(result.end(), more.begin(), more.end());
+        }
+      }
+      else {
+        const int64_t databaseCount = repo_->countUnique(excluded);
+        if (start < databaseCount) {
+          result = repo_->rangeUnique(static_cast<int>(start), num, false,
+                                       excluded);
+        }
+        appendMemory(std::max<int64_t>(start - databaseCount, 0), num);
+      }
       return result;
     }
-    if (off < D) {
-#ifdef HAVE_SQLITE3
-      if (repo_) {
-        try {
-          result = repo_->range(off, num, /*desc=*/false);
-        }
-        catch (RecoverableException& ex) {
-          A2_LOG_ERROR_EX("sqlite3-persistence: tellStopped DB read failed; "
-                          "degrading to memory-only",
-                          ex);
-          result.clear();
-        }
-      }
-#endif
-      if (static_cast<int>(result.size()) < num) {
-        int needed = num - static_cast<int>(result.size());
-        for (int i = 0; i < needed && i < M; ++i) {
-          result.push_back(mem[i]);
-        }
-      }
-    }
-    else {
-      // off >= D: slice purely from memory
-      int memOff = off - D;
-      int end = std::min(memOff + num, M);
-      for (int i = memOff; i < end; ++i) {
-        result.push_back(mem[i]);
-      }
+    catch (RecoverableException& error) {
+      A2_LOG_ERROR_EX("sqlite3-persistence: history read failed; "
+                      "degrading to memory-only", error);
+      result.clear();
     }
   }
-  else {
-    // DESC slice (offset < 0)
-    int abs_off = -offset - 1;
-    if (abs_off < 0 || abs_off >= M + D) {
-      return result;
-    }
-    if (abs_off < M) {
-      // Take from tail of mem (newest-first)
-      int start = M - 1 - abs_off;
-      int end = std::max(start - num + 1, 0);
-      for (int i = start; i >= end; --i) {
-        result.push_back(mem[i]);
-      }
-      if (static_cast<int>(result.size()) < num) {
-        int needed = num - static_cast<int>(result.size());
-#ifdef HAVE_SQLITE3
-        if (repo_) {
-          try {
-            auto more = repo_->range(0, needed, /*desc=*/true);
-            for (auto& dr : more) {
-              result.push_back(dr);
-            }
-          }
-          catch (RecoverableException& ex) {
-            A2_LOG_ERROR_EX("sqlite3-persistence: tellStopped DB read failed; "
-                            "degrading to memory-only",
-                            ex);
-          }
-        }
 #endif
-      }
-    }
-    else {
-#ifdef HAVE_SQLITE3
-      if (repo_) {
-        try {
-          int dbOff = abs_off - M;
-          result = repo_->range(dbOff, num, /*desc=*/true);
-        }
-        catch (RecoverableException& ex) {
-          A2_LOG_ERROR_EX(
-              "sqlite3-persistence: tellStopped DB read failed", ex);
-        }
-      }
-#endif
-    }
-  }
-
+  appendMemory(start, num);
   return result;
 }
 
 int64_t RequestGroupMan::getDownloadResultsCount() const
 {
-  int64_t count = static_cast<int64_t>(downloadResults_.size());
+  std::set<a2_gid_t> seen;
+  for (const auto& group : requestGroups_) {
+    seen.insert(group->getGID());
+  }
+  for (const auto& group : reservedGroups_) {
+    seen.insert(group->getGID());
+  }
+  int64_t count = 0;
+  for (const auto& result : downloadResults_) {
+    if (seen.insert(result->gid->getNumericId()).second) {
+      ++count;
+    }
+  }
 #ifdef HAVE_SQLITE3
   if (repo_) {
     try {
-      count += repo_->countAll();
+      std::vector<a2_gid_t> excluded(seen.begin(), seen.end());
+      count += repo_->countUnique(excluded);
     }
-    catch (RecoverableException& ex) {
-      A2_LOG_ERROR_EX("sqlite3-persistence: countAll failed", ex);
+    catch (RecoverableException& error) {
+      A2_LOG_ERROR_EX("sqlite3-persistence: unique history count failed", error);
     }
   }
 #endif
