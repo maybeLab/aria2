@@ -2028,6 +2028,7 @@ void RpcMethodTest::testTellStoppedReadsBeyondMemoryCache()
 #ifdef HAVE_SQLITE3
 void RpcMethodTest::testTellStoppedAfterCascadedAddDownloadResult()
 {
+  option_->put(PREF_SQLITE3_HISTORY_LIMIT, "-1");
   std::string dbPath =
       std::string(A2_TEST_OUT_DIR) + "/tell_stopped_cascade.db";
   std::remove(dbPath.c_str());
@@ -2056,6 +2057,7 @@ void RpcMethodTest::testTellStoppedAfterCascadedAddDownloadResult()
   dr->numPieces = 1;
   dr->pieceLength = 1024;
   e_->getRequestGroupMan()->addDownloadResult(dr);
+  CPPUNIT_ASSERT_EQUAL(int64_t(1), repo->countAll());
   // dr stays alive: mem holds it via downloadResults_ AND we hold a
   // shared_ptr in this scope. The slot is owned.
 
@@ -2098,6 +2100,7 @@ void RpcMethodTest::testTellStoppedAfterCascadedAddDownloadResult()
 #ifdef HAVE_SQLITE3
 void RpcMethodTest::testUniqueHistoryPaginationAndReads()
 {
+  option_->put(PREF_SQLITE3_HISTORY_LIMIT, "-1");
   std::string databasePath =
       std::string(A2_TEST_OUT_DIR) + "/unique_history.db";
   std::remove(databasePath.c_str());
@@ -2126,6 +2129,7 @@ void RpcMethodTest::testUniqueHistoryPaginationAndReads()
     expected.push_back(result->gid->getNumericId());
     manager->addDownloadResult(result);
   }
+  CPPUNIT_ASSERT_EQUAL(int64_t(6), repository->countAll());
   CPPUNIT_ASSERT_EQUAL(int64_t(6), manager->getDownloadResultsCount());
   CPPUNIT_ASSERT(manager->getDownloadResultsRange(-1, 1, true).front() ==
                   manager->getDownloadResults().get(expected.back()));
